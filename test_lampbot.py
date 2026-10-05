@@ -84,7 +84,7 @@ async def main():
     http = await lampbot.run_http_stub()
     lamp = lampbot.Lamp(port=18830)
     lamp.start()
-    lampbot.build_dispatcher(lamp)
+    dp = lampbot.build_dispatcher(lamp)
 
     r, w = await asyncio.open_connection("127.0.0.1", 18080)
     w.write(b"GET /firmwares/v1/products/1/firmware-version HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -116,10 +116,32 @@ async def main():
     assert ("led-speed", "100") in received
     assert ("led-mode", "Meteor") in received
     assert lamp.state.get("led-module/led-color-1") == "117,213,28"
+    panel, apply = dp["panel"], dp["apply"]
+    seen, todo, clicked = set(), ["main"], 0
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        text, markup = panel(name, 1)
+        assert text
+        for row in markup.inline_keyboard:
+            for button in row:
+                data = button.callback_data
+                assert len(data.encode()) <= 64, data
+                action, _, arg = data.partition(":")
+                if action == "nav":
+                    todo.append(arg)
+                elif action not in ("target", "status"):
+                    result = apply(action, arg)
+                    assert not result.startswith(("?", "Need", "Unknown", "No such", "No scene")), (data, result)
+                    clicked += 1
+    assert {"main", "colors", "bright", "modes", "modes:static", "modes:anim", "modes:sound", "scenes", "timers", "more"} <= seen, seen
+    print("menu OK:", len(seen), "pages,", clicked, "buttons")
     print("ALL OK")
 
-    lamp.stop()
-    fake.loop_stop()
+    await asyncio.get_running_loop().run_in_executor(None, lamp.stop)
+    await asyncio.get_running_loop().run_in_executor(None, fake.loop_stop)
     http.close()
     await broker.shutdown()
 

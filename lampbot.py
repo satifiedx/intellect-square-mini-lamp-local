@@ -186,6 +186,14 @@ class Lamp:
     def mode(self, name: str):
         return self.send("led-mode", name)
 
+    def summary(self) -> str:
+        if not self.known:
+            return "Waiting for the lamp to connect..."
+        g = lambda k: self.state.get("led-module/" + k, "?")
+        icon = "🟢" if g("led-on") == "true" else "⚫"
+        return (f"{icon} {g('led-mode')}, brightness {g('led-brightness')}\n"
+                f"color {g('led-color-1')}, speed {g('led-speed')}, intensity {g('led-intensity')}")
+
     def status_text(self) -> str:
         if not self.known:
             return "The lamp has not connected to the broker yet."
@@ -251,6 +259,17 @@ async def run_http_stub():
     except OSError as e:
         log.warning("http stub not started on port %d (%s), the lamp may boot a bit slower", HTTP_PORT, e)
         return None
+
+
+GROUPS = {
+    "static": ("Static", MODES[:5]),
+    "anim": ("Animated", MODES[5:14]),
+    "sound": ("Sound reactive", MODES[14:]),
+}
+
+
+def group_of(mode: str) -> str:
+    return next((k for k, (_, ms) in GROUPS.items() if mode in ms), "static")
 
 
 def lan_ip() -> str:
@@ -399,35 +418,95 @@ async def run_agent_llm(text: str, lamp: Lamp):
 def build_dispatcher(lamp: Lamp):
     from aiogram import Dispatcher, F
     from aiogram.filters import Command, CommandStart
+    from aiogram.exceptions import TelegramBadRequest
     from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
     dp = Dispatcher()
     b = InlineKeyboardButton
 
-    def kb() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [b(text="On", callback_data="on"), b(text="Off", callback_data="off"),
-             b(text="Status", callback_data="status")],
-            [b(text="🔴", callback_data="c:red"), b(text="🟠", callback_data="c:orange"),
-             b(text="🟡", callback_data="c:yellow"), b(text="🟢", callback_data="c:green"),
-             b(text="🔵", callback_data="c:blue"), b(text="🟣", callback_data="c:purple")],
-            [b(text="White", callback_data="c:white"), b(text="Warm", callback_data="c:warm"),
-             b(text="Pink", callback_data="c:pink")],
-            [b(text="10%", callback_data="b:10"), b(text="30%", callback_data="b:30"),
-             b(text="60%", callback_data="b:60"), b(text="100%", callback_data="b:100")],
-            [b(text="All modes", callback_data="modes"), b(text="Scenes", callback_data="scenes")],
-        ])
+    targets: dict[int, str] = {}
+    palette = [("🔴", "red"), ("🟠", "orange"), ("🟡", "yellow"), ("🟢", "green"), ("🩵", "cyan"),
+               ("🔵", "blue"), ("🟣", "purple"), ("🩷", "pink"), ("⚪", "white"), ("🕯", "warm")]
 
-    def modes_kb() -> InlineKeyboardMarkup:
-        rows = [[b(text=m, callback_data=f"m:{m}") for m in MODES[i:i + 2]] for i in range(0, len(MODES), 2)]
-        rows.append([b(text="speed 20", callback_data="s:20"), b(text="speed 50", callback_data="s:50"),
-                     b(text="speed 90", callback_data="s:90")])
-        return InlineKeyboardMarkup(inline_keyboard=rows)
+    def btn(text: str, data: str):
+        return b(text=text, callback_data=data)
 
-    def scenes_kb() -> InlineKeyboardMarkup:
-        names = list(load_scenes())
-        rows = [[b(text=n, callback_data=f"scene:{n}") for n in names[i:i + 3]] for i in range(0, len(names), 3)]
-        return InlineKeyboardMarkup(inline_keyboard=rows or [[b(text="no scenes yet, use /save name", callback_data="status")]])
+    def page(name: str, uid: int):
+        head = lamp.summary()
+        g = lambda k: lamp.state.get("led-module/" + k, "?")
+        back = [btn("⬅ Back", "nav:main")]
+        if name == "main":
+            on = g("led-on") == "true"
+            return head, [
+                [btn("Turn off" if on else "Turn on", "off" if on else "on"), btn("Refresh", "nav:main")],
+                [btn("🎨 Colors", "nav:colors"), btn("💡 Brightness", "nav:bright"), btn("✨ Modes", "nav:modes")],
+                [btn("🎬 Scenes", "nav:scenes"), btn("⏱ Timers", "nav:timers"), btn("⚙ More", "nav:more")],
+            ]
+        if name == "colors":
+            t = targets.get(uid, "1")
+            return head + "\nPick a color", [
+                [btn(e, f"c:{n}") for e, n in palette[:5]],
+                [btn(e, f"c:{n}") for e, n in palette[5:]],
+                [btn(f"Editing color {t}, tap to switch", "target")],
+                back,
+            ]
+        if name == "bright":
+            return head, [
+                [btn(f"{v}%", f"b:{v}") for v in (10, 25, 50, 75, 100)],
+                [btn("−10", "bd:-10"), btn("+10", "bd:10")],
+                back,
+            ]
+        if name == "modes":
+            return head + "\nPick a group", [
+                [btn(label, f"nav:modes:{k}") for k, (label, _) in GROUPS.items()],
+                [btn("Speed −", "sd:-10"), btn("Speed +", "sd:10"), btn("Intensity −", "id:-10"), btn("Intensity +", "id:10")],
+                back,
+            ]
+        if name.startswith("modes:"):
+            label, ms = GROUPS[name.split(":", 1)[1]]
+            rows = [[btn(m, f"m:{m}") for m in ms[i:i + 2]] for i in range(0, len(ms), 2)]
+            rows.append([btn("Speed −", "sd:-10"), btn("Speed +", "sd:10"), btn("Intensity −", "id:-10"), btn("Intensity +", "id:10")])
+            rows.append([btn("⬅ Groups", "nav:modes")])
+            return head + f"\n{label}", rows
+        if name == "scenes":
+            names = list(load_scenes())
+            rows = [[btn(n, f"scene:{n}") for n in names[i:i + 3]] for i in range(0, len(names), 3)]
+            return head + "\nSave the current look with /save name", rows + [back]
+        if name == "timers":
+            return (head + f"\nSleep timer: {g('led-timer-time')}, left {g('led-timer-left')}, running {g('led-timer-start')}"
+                    f"\nSunrise: {g('led-sunrise-time')}, enabled {g('led-sunrise-enabled')}"
+                    "\nExact time: /timer 00:45 and /sunrise 07:30"), [
+                [btn("15 min", "t:00:15"), btn("30 min", "t:00:30"), btn("1 h", "t:01:00"), btn("2 h", "t:02:00")],
+                [btn("Stop timer", "t:off"), btn("Sunrise on", "sr:on"), btn("Sunrise off", "sr:off")],
+                back,
+            ]
+        return head + f"\nEco: {g('power-limit')}, mic sensitivity {g('led-mic-sens')}", [
+            [btn("Eco on", "eco:on"), btn("Eco off", "eco:off")],
+            [btn(f"Mic sens {v}", f"ms:{v}") for v in (30, 60, 90)],
+            [btn("Full status", "status")],
+            back,
+        ]
+
+    def panel(name: str, uid: int):
+        text, rows = page(name, uid)
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def page_after(action: str, arg: str) -> str:
+        if action in ("c", "c2", "c3"):
+            return "colors"
+        if action in ("b", "bd"):
+            return "bright"
+        if action == "m":
+            return "modes:" + group_of(arg)
+        if action in ("s", "sd", "i", "id"):
+            return "modes:" + group_of(lamp.state.get("led-module/led-mode", ""))
+        if action == "scene":
+            return "scenes"
+        if action in ("t", "sr"):
+            return "timers"
+        if action in ("eco", "ms", "mn", "fade"):
+            return "more"
+        return "main"
 
     def allowed(user_id: int) -> bool:
         return user_id in ALLOWED_IDS
@@ -478,6 +557,15 @@ def build_dispatcher(lamp: Lamp):
             lamp.power(True)
             lamp.mode(mode)
             return f"Mode {mode}"
+        if action in ("bd", "sd", "id"):
+            key = {"bd": "led-brightness", "sd": "led-speed", "id": "led-intensity"}[action]
+            try:
+                value = int(lamp.state.get("led-module/" + key, 50)) + int(arg)
+            except ValueError:
+                return "?"
+            value = max(1 if action == "bd" else 0, min(100, value))
+            lamp.prop(key, value)
+            return f"{key.split('-')[1].capitalize()} {value}"
         if action == "t":
             if arg.lower() in ("off", "stop"):
                 lamp.send("led-timer-start", "false")
@@ -537,7 +625,8 @@ def build_dispatcher(lamp: Lamp):
     @dp.message(Command("menu"))
     @guarded
     async def start(message: Message):
-        await message.answer("Lamp remote:", reply_markup=kb())
+        text, markup = panel("main", message.from_user.id)
+        await message.answer(text, reply_markup=markup)
 
     @dp.message(Command("on"))
     @guarded
@@ -557,7 +646,8 @@ def build_dispatcher(lamp: Lamp):
     @dp.message(Command("modes"))
     @guarded
     async def modes(message: Message):
-        await message.answer("Modes:", reply_markup=modes_kb())
+        text, markup = panel("modes", message.from_user.id)
+        await message.answer(text, reply_markup=markup)
 
     commands = {"brightness": "b", "speed": "s", "intensity": "i", "color": "c", "color2": "c2",
                 "color3": "c3", "mode": "m", "timer": "t", "sunrise": "sr", "fade": "fade",
@@ -584,24 +674,36 @@ def build_dispatcher(lamp: Lamp):
     @dp.message(Command("scenes"))
     @guarded
     async def scenes(message: Message):
-        await message.answer("Scenes:", reply_markup=scenes_kb())
+        text, markup = panel("scenes", message.from_user.id)
+        await message.answer(text, reply_markup=markup)
+
+    async def show(call: CallbackQuery, name: str):
+        text, markup = panel(name, call.from_user.id)
+        try:
+            await call.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            pass
 
     @dp.callback_query(F.data)
     async def cb(call: CallbackQuery):
         if not allowed(call.from_user.id):
             return await call.answer("No access", show_alert=True)
-        data = call.data
-        if data == "modes":
-            await call.message.answer("Modes:", reply_markup=modes_kb())
+        uid = call.from_user.id
+        action, _, arg = call.data.partition(":")
+        if action == "nav":
+            await show(call, arg)
             return await call.answer()
-        if data == "scenes":
-            await call.message.answer("Scenes:", reply_markup=scenes_kb())
+        if action == "target":
+            targets[uid] = {"1": "2", "2": "3", "3": "1"}[targets.get(uid, "1")]
+            await show(call, "colors")
             return await call.answer()
-        if data == "status":
+        if action == "status":
             await call.message.answer(lamp.status_text())
             return await call.answer()
-        action, _, arg = data.partition(":")
-        await call.answer(apply(action, arg))
+        act = {"1": "c", "2": "c2", "3": "c3"}[targets.get(uid, "1")] if action == "c" else action
+        await call.answer(apply(act, arg))
+        await asyncio.sleep(0.5)
+        await show(call, page_after(action, arg))
 
     async def run_agent(message: Message, text: str):
         try:
@@ -633,6 +735,7 @@ def build_dispatcher(lamp: Lamp):
             return await message.answer("GROQ_API_KEY is not set in .env")
         await run_agent(message, message.text)
 
+    dp["panel"], dp["apply"], dp["page_after"] = panel, apply, page_after
     return dp
 
 
@@ -659,7 +762,7 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        lamp.stop()
+        await asyncio.get_running_loop().run_in_executor(None, lamp.stop)
         if http:
             http.close()
         if dns:

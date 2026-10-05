@@ -25,6 +25,30 @@ So the trick is simple: make `intellect.properties` point to your own machine, r
 
 Full topic list and value ranges: [docs/protocol.md](docs/protocol.md).
 
+## Step by step
+
+The whole path from zero to a lamp you control from Telegram:
+
+1. **Get a bot.** In Telegram write to @BotFather, send `/newbot`, copy the token.
+2. **Optional, for voice and text:** make a free key at console.groq.com.
+3. **Install.** Python 3.10+, then clone the repo and run `pip install -r requirements.txt`, copy `.env.example` to `.env` and put `BOT_TOKEN` and `GROQ_API_KEY` there.
+4. **Give the machine a fixed IP.** In your router, make a DHCP reservation for the PC or Raspberry Pi that will run the bot. Remember its IP.
+5. **Start the bot:** `python lampbot.py`. Allow the firewall prompt for private networks. You should see the broker and the http stub start.
+6. **Let the bot know you.** Write `/start` to your bot, it answers with your Telegram id. Put it in `ALLOWED_IDS` in `.env`, restart the bot.
+7. **Make the lamp talk to your machine.** The lamp looks up `intellect.properties`. Make that name point to the machine's IP, see [Point the lamp at your machine](#point-the-lamp-at-your-machine). OpenWrt, Pi-hole, AdGuard, MikroTik and others override the name directly. If your router cannot, turn on the built in DNS (`DNS_STUB=1`) and set the machine as the DNS server in the router's DHCP settings.
+8. **Check the name.** On any PC in the network run `nslookup intellect.properties`, it must show your machine's IP. If it still shows another address, wait a minute or restart the PC's network, DNS caches are slow.
+9. **Reconnect the lamp.** Unplug it for 3 seconds and plug it back. Within about 30 seconds the bot log shows the http request from the lamp and then `lamp found`.
+10. **Done.** Write `/menu` to the bot.
+
+If the lamp never shows up in the log:
+
+- the PC and the lamp must be in the same network (no guest Wi-Fi, no client isolation)
+- the firewall must allow incoming TCP on 1883 and 80 (and UDP 53 if you use the DNS stub)
+- the machine's IP in the DNS override must be the current one (that is why step 4 matters)
+- a VPN on the PC can hide it from the lamp, turn it off while testing
+
+To go back to the official app, remove the DNS override (or turn the DNS stub off) and replug the lamp.
+
 ## What you need
 
 - Python 3.10+
