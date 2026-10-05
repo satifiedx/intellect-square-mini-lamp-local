@@ -8,7 +8,7 @@
 
 ## Як це працює
 
-У лампі чип типу ESP32 із закритою прошивкою. Порти в локальній мережі всі закриті, але при старті лампа дуже балакуча. Я поснифив її на роутері через tcpdump і з'ясував:
+У лампі ESP8266 (модуль ESP-07S) із закритою прошивкою. Порти в локальній мережі всі закриті, але при старті лампа дуже балакуча. Я поснифив її на роутері через tcpdump і з'ясував:
 
 1. Вона резолвить `intellect.properties` через звичайний DNS.
 2. По голому HTTP на порт 80 питає `GET /firmwares/v1/products/<id>/firmware-version` і чекає `{"firmware_version":"6"}`.
@@ -122,6 +122,18 @@ AdGuard Home: Filters, DNS rewrites, додай `intellect.properties` з IP.
 Solid, Solid 2, Solid 3, Percent, Percent 2, Strobe, Rainbow, Gradient, Fireworks, Meteor, Fire, Blends, Random colors, Plasma, Sound reactive percent, Sound reactive lighthouse, Sound reactive fire, Sound reactive equalizer, Sound reactive strobe.
 
 Що видно з трафіку офіційного додатка: Solid режими беруть колір 1, Gradient і Plasma ще й колір 2, Meteor бере два кольори, Strobe залежить від швидкості, звукові режими використовують `led-mic-sens` і `led-mic-noise`. Кожен режим я не перевіряв, тож якщо дізнаєшся більше, кидай issue або PR.
+
+## Залізо і прошивка
+
+Усе, що я знайшов про лампу, лежить у `docs`:
+
+- [docs/hardware.uk.md](docs/hardware.uk.md): що є на платі, контакти ESP-07S, підключення UART
+- [docs/firmware.uk.md](docs/firmware.uk.md): родна прошивка (ESP8266 RTOS SDK), розмітка флешу, час завантаження, сервіси
+- [docs/protocol.uk.md](docs/protocol.uk.md): усі MQTT топіки і діапазони значень
+- [docs/flashing.uk.md](docs/flashing.uk.md): моя спроба прошити по UART, що не вийшло, що пробувати, як отримати WLED іншим шляхом
+- [docs/boot-log.txt](docs/boot-log.txt) і [docs/homie-description.txt](docs/homie-description.txt): сирий матеріал, з якого прибрано пароль Wi-Fi, дані MQTT, mac, IP і країну
+
+Коротко: ESP8266 із флешем 4 МБ і двома слотами OTA, дані стрічки на GPIO3 через I2S, UART на 74880 бод. Лампа входить у режим завантаження по UART, але змусити чип відповідати `esptool` мені не вдалося, тож дампу прошивки ще немає. Допомога вітається, дивись [docs/flashing.uk.md](docs/flashing.uk.md).
 
 ## Варто знати
 

@@ -8,7 +8,7 @@ Unofficial project, not affiliated with INTELLECT. Use at your own risk.
 
 ## How it works
 
-The lamp has an ESP32 class chip with closed firmware. Nothing listens on its ports, but it is very chatty on boot. I sniffed it on the router with tcpdump and found out:
+The lamp has an ESP8266 (ESP-07S module) with closed firmware. Nothing listens on its ports, but it is very chatty on boot. I sniffed it on the router with tcpdump and found out:
 
 1. It resolves `intellect.properties` through your normal DNS.
 2. It asks `GET /firmwares/v1/products/<id>/firmware-version` over plain HTTP on port 80 and expects `{"firmware_version":"6"}`.
@@ -122,6 +122,18 @@ The lamp reports the full list itself:
 Solid, Solid 2, Solid 3, Percent, Percent 2, Strobe, Rainbow, Gradient, Fireworks, Meteor, Fire, Blends, Random colors, Plasma, Sound reactive percent, Sound reactive lighthouse, Sound reactive fire, Sound reactive equalizer, Sound reactive strobe.
 
 What I saw in the official app traffic: Solid modes use color 1, Gradient and Plasma also use color 2, Meteor uses two colors, Strobe depends on speed, the sound reactive ones use `led-mic-sens` and `led-mic-noise`. I did not verify every mode, so if you find out more, open an issue or a PR.
+
+## Hardware and firmware
+
+Everything I found about the lamp lives in `docs`:
+
+- [docs/hardware.md](docs/hardware.md): what is on the board, ESP-07S pads, UART wiring
+- [docs/firmware.md](docs/firmware.md): the stock firmware (ESP8266 RTOS SDK), flash layout, boot timing, services
+- [docs/protocol.md](docs/protocol.md): every MQTT topic and value range
+- [docs/flashing.md](docs/flashing.md): my UART flashing attempt, what failed, what to try, how to get WLED another way
+- [docs/boot-log.txt](docs/boot-log.txt) and [docs/homie-description.txt](docs/homie-description.txt): the raw material, with the Wi-Fi password, MQTT credentials, mac, IPs and country removed
+
+Short version: ESP8266 with 4 MB flash and two OTA slots, LED data on GPIO3 through I2S, UART at 74880 baud. The lamp enters UART download mode, but I could not get the chip to answer `esptool`, so there is no firmware dump yet. Help is welcome, see [docs/flashing.md](docs/flashing.md).
 
 ## Good to know
 
