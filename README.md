@@ -84,6 +84,23 @@ Pi-hole: Local DNS, DNS Records, add `intellect.properties` with the IP.
 
 AdGuard Home: Filters, DNS rewrites, add `intellect.properties` with the IP.
 
+Other routers that can override one name:
+
+- dnsmasq based firmware (DD-WRT, Asus Merlin, Tomato): add `address=/intellect.properties/192.168.1.50` to the custom dnsmasq options
+- MikroTik: `/ip dns static add name=intellect.properties address=192.168.1.50`
+- pfSense: Services, DNS Resolver, Host Overrides. OPNsense: Services, Unbound DNS, Overrides
+
+### No such option on your router? Let the bot do it
+
+Most routers cannot override a single name but let you choose which DNS server the DHCP hands out. The bot has a tiny DNS server built in for exactly this:
+
+1. In `.env` set `DNS_STUB=1`. Optional: `DNS_UPSTREAM=192.168.1.1` (where all other names are forwarded, default `8.8.8.8`, the port can be added like `1.1.1.1:53`) and `LAN_IP=192.168.1.50` if the bot guesses the wrong address of the machine.
+2. Start the bot. It logs `dns stub on port 53`. Port 53 needs admin rights on Linux and macOS, and on Windows it must be free (Docker, WSL or Internet Connection Sharing can occupy it).
+3. In the router's DHCP settings put the machine's IP as the DNS server. If there is a second DNS field, put the router's own IP or `1.1.1.1` there as a fallback.
+4. Reconnect the lamp (unplug and plug) so it picks up the new DNS.
+
+The stub answers `intellect.properties` with the machine's IP and forwards everything else untouched. The catch: every device on your network now asks that machine for names, so give it a fixed IP, and expect slow lookups for a while whenever it is switched off (that is what the fallback DNS is for).
+
 Check from any PC: `nslookup intellect.properties` must return your machine. Then unplug the lamp and plug it back. In the bot log you should see the http request and then `lamp found`.
 
 To undo it, remove the override (on OpenWrt `uci del_list dhcp.@dnsmasq[0].address='/intellect.properties/192.168.1.50'`, commit, restart dnsmasq) and replug the lamp.
@@ -100,6 +117,12 @@ To undo it, remove the override (on OpenWrt `uci del_list dhcp.@dnsmasq[0].addre
 | `/color2 ...`, `/color3 ...` | colors 2 and 3 |
 | `/mode Meteor` | effect by name, `/modes` shows buttons for all of them |
 | `/speed 0-100`, `/intensity 0-100` | effect speed and intensity |
+| `/timer 00:30`, `/timer off` | sleep timer, the lamp turns off after that time |
+| `/sunrise 07:30`, `/sunrise on`, `/sunrise off` | sunrise alarm |
+| `/fade 00:05` | fade duration |
+| `/micsens 0-100`, `/micnoise 0-100` | microphone sensitivity and noise for the sound reactive modes |
+| `/eco on`, `/eco off` | power saving mode (lower current limit) |
+| `/save evening`, `/scenes`, `/scene evening` | save the current look (mode, colors, brightness, speed, intensity) under a name and bring it back later |
 
 Color names work in English, Russian and Ukrainian.
 
@@ -110,6 +133,9 @@ If `GROQ_API_KEY` is set, just send a voice message or plain text, no command ne
 - "turn on meteor, blue and purple, full speed"
 - "make it warm and dim"
 - "вмикай веселку повільніше"
+- "put me to sleep in 20 minutes"
+- "wake me up at seven thirty"
+- "turn on the evening scene"
 
 Voice goes to Groq Whisper, the text goes to an LLM with a short prompt that returns a JSON list of actions, the bot applies them and replies what it did. The LLM is `openai/gpt-oss-20b` on Groq by default, change it with `GROQ_LLM` in `.env` if Groq renames or retires it (`GET https://api.groq.com/openai/v1/models` lists what you have).
 

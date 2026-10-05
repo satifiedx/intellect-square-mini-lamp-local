@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+import socket
+import struct
 import sys
 import tempfile
 import time
@@ -39,6 +41,11 @@ AGENT = os.getenv("AGENT", "groq")
 AGY_MODEL = os.getenv("AGY_MODEL", "gemini-3.8-flash-low")
 AGY_EXE = os.getenv("AGY_EXE", "agy")
 GROQ = "https://api.groq.com/openai/v1"
+DNS_STUB = os.getenv("DNS_STUB", "0") == "1"
+DNS_PORT = int(os.getenv("DNS_PORT", "53"))
+DNS_UPSTREAM = os.getenv("DNS_UPSTREAM", "8.8.8.8")
+LAN_IP = os.getenv("LAN_IP", "")
+DNS_NAME = "intellect.properties"
 
 MODES = [
     "Solid", "Solid 2", "Solid 3", "Percent", "Percent 2", "Strobe", "Rainbow", "Gradient",
@@ -69,6 +76,27 @@ COLORS = {
 def find_mode(text: str):
     t = text.strip().lower()
     return next((m for m in MODES if m.lower() == t), None)
+
+
+SCENES_FILE = Path(os.getenv("SCENES_FILE") or Path(__file__).with_name("scenes.json"))
+
+
+def load_scenes() -> dict:
+    try:
+        return json.loads(SCENES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_scene(name: str, snap: dict) -> None:
+    scenes = load_scenes()
+    scenes[name] = snap
+    SCENES_FILE.write_text(json.dumps(scenes, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def parse_hhmm(text: str):
+    m = re.fullmatch(r"([01]?\d|2[0-3])[:.]([0-5]\d)", text.strip())
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else None
 
 
 def parse_color(text: str):
@@ -132,10 +160,10 @@ class Lamp:
     def known(self) -> bool:
         return self.prefix is not None and self.dev is not None
 
-    def send(self, prop: str, value) -> bool:
+    def send(self, prop: str, value, node: str = "led-module") -> bool:
         if not self.known:
             return False
-        topic = f"{self.prefix}/sweet-home/{self.dev}/led-module/{prop}/set"
+        topic = f"{self.prefix}/sweet-home/{self.dev}/{node}/{prop}/set"
         log.info("-> %s = %s", prop, value)
         self.client.publish(topic, str(value), qos=1)
         return True
@@ -171,9 +199,18 @@ class Lamp:
             f"Color 2/3: {g('led-color-2')} / {g('led-color-3')}\n"
             f"Mode: {g('led-mode')}\n"
             f"Speed: {g('led-speed')}, intensity: {g('led-intensity')}\n"
+            f"Sleep timer: {g('led-timer-time')} (left {g('led-timer-left')}, running {g('led-timer-start')})\n"
+            f"Sunrise: {g('led-sunrise-time')} (enabled {g('led-sunrise-enabled')})\n"
+            f"Fade time: {g('led-fade-time')}, eco: {g('power-limit')}\n"
+            f"LEDs: {g('led-count')}, firmware: {self.state.get('status-control/firmware-version', '?')}\n"
             f"Wi-Fi: {self.state.get('$telemetry/signal', '?')}\n"
             f"Uptime: {self.state.get('status-control/system-uptime', '?')}"
         )
+
+    def snapshot(self) -> dict:
+        keys = ("led-mode", "led-color-1", "led-color-2", "led-color-3",
+                "led-brightness", "led-speed", "led-intensity")
+        return {k: self.state["led-module/" + k] for k in keys if "led-module/" + k in self.state}
 
 
 async def run_broker():
@@ -216,13 +253,85 @@ async def run_http_stub():
         return None
 
 
+def lan_ip() -> str:
+    if LAN_IP:
+        return LAN_IP
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+
+
+def dns_question(data: bytes):
+    i, labels = 12, []
+    while data[i]:
+        n = data[i]
+        labels.append(data[i + 1:i + 1 + n].decode("ascii", "replace").lower())
+        i += n + 1
+    return ".".join(labels), struct.unpack(">H", data[i + 1:i + 3])[0], i + 5
+
+
+def dns_answer(data: bytes, ip: str) -> bytes:
+    _, qtype, end = dns_question(data)
+    a_record = qtype == 1
+    head = data[:2] + b"\x81\x80" + data[4:6] + (b"\x00\x01" if a_record else b"\x00\x00") + b"\x00\x00\x00\x00"
+    answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + socket.inet_aton(ip) if a_record else b""
+    return head + data[12:end] + answer
+
+
+def dns_forward(data: bytes) -> bytes:
+    host, _, port = DNS_UPSTREAM.partition(":")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(3)
+        s.sendto(data, (host, int(port or 53)))
+        return s.recv(4096)
+
+
+class DnsStub(asyncio.DatagramProtocol):
+    def __init__(self, ip: str):
+        self.ip = ip
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        asyncio.get_running_loop().create_task(self.reply(data, addr))
+
+    async def reply(self, data, addr):
+        try:
+            name, _, _ = dns_question(data)
+            if name == DNS_NAME:
+                out = dns_answer(data, self.ip)
+            else:
+                out = await asyncio.get_running_loop().run_in_executor(None, dns_forward, data)
+            self.transport.sendto(out, addr)
+        except Exception as e:
+            log.debug("dns: %s", e)
+
+
+async def run_dns_stub():
+    ip = lan_ip()
+    try:
+        transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: DnsStub(ip), local_addr=("0.0.0.0", DNS_PORT))
+    except OSError as e:
+        log.warning("dns stub not started on port %d (%s)", DNS_PORT, e)
+        return None
+    log.info("dns stub on port %d: %s -> %s, everything else goes to %s", DNS_PORT, DNS_NAME, ip, DNS_UPSTREAM)
+    return transport
+
+
 AGENT_PROMPT = (
     "You control a smart RGB lamp. The user speaks Russian, Ukrainian or English. "
     "Answer with JSON only:\n"
     '{"actions":[{"a":"...","v":...}],"reply":"short answer or empty string"}\n'
     "Actions (a): on, off (no v); b brightness 1-100; s effect speed 0-100; i intensity 0-100; "
     'c, c2, c3 colors 1/2/3, v is "#rrggbb" (convert color names to hex yourself); '
-    "m mode, v is the EXACT name from this list: " + ", ".join(MODES) + ".\n"
+    "m mode, v is the EXACT name from this list: " + ", ".join(MODES) + ". "
+    'sleep timer: t with v "HH:MM" (turns the lamp off after that long) or "off"; '
+    'sunrise alarm: sr with v "HH:MM" (wake up time, enables it), "on" or "off"; '
+    'fade: fade with v "HH:MM" (fade duration); ms and mn microphone sensitivity and noise 0-100 for sound reactive modes; '
+    'eco with v "on" or "off" (power saving, lower current limit); '
+    "scene with v the name of a saved scene (a list of saved scenes may follow).\n"
     "Solid is one color. Meteor, Gradient, Plasma and some others use colors 1 and 2. "
     "Strobe and many effects depend on speed s. Sound reactive modes listen to the mic. "
     "You can chain actions, order matters (mode first, then colors). "
@@ -272,7 +381,8 @@ async def groq_chat(system: str, text: str) -> dict:
 
 
 async def run_agent_llm(text: str, lamp: Lamp):
-    system = AGENT_PROMPT + ("\nCurrent state: " + lamp.status_text() if lamp.known else "")
+    scenes = ", ".join(load_scenes()) or "none"
+    system = AGENT_PROMPT + f"\nSaved scenes: {scenes}" + ("\nCurrent state: " + lamp.status_text() if lamp.known else "")
     data = None
     if AGENT == "agy":
         try:
@@ -282,7 +392,7 @@ async def run_agent_llm(text: str, lamp: Lamp):
             log.warning("agy failed (%s), falling back to groq", e)
     if data is None:
         data = await groq_chat(system, text)
-    allowed = ("on", "off", "b", "c", "c2", "c3", "s", "i", "m")
+    allowed = ("on", "off", "b", "c", "c2", "c3", "s", "i", "m", "t", "sr", "fade", "ms", "mn", "eco", "scene")
     return [a for a in data.get("actions", []) if a.get("a") in allowed], data.get("reply", "")
 
 
@@ -305,7 +415,7 @@ def build_dispatcher(lamp: Lamp):
              b(text="Pink", callback_data="c:pink")],
             [b(text="10%", callback_data="b:10"), b(text="30%", callback_data="b:30"),
              b(text="60%", callback_data="b:60"), b(text="100%", callback_data="b:100")],
-            [b(text="All modes", callback_data="modes")],
+            [b(text="All modes", callback_data="modes"), b(text="Scenes", callback_data="scenes")],
         ])
 
     def modes_kb() -> InlineKeyboardMarkup:
@@ -313,6 +423,11 @@ def build_dispatcher(lamp: Lamp):
         rows.append([b(text="speed 20", callback_data="s:20"), b(text="speed 50", callback_data="s:50"),
                      b(text="speed 90", callback_data="s:90")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def scenes_kb() -> InlineKeyboardMarkup:
+        names = list(load_scenes())
+        rows = [[b(text=n, callback_data=f"scene:{n}") for n in names[i:i + 3]] for i in range(0, len(names), 3)]
+        return InlineKeyboardMarkup(inline_keyboard=rows or [[b(text="no scenes yet, use /save name", callback_data="status")]])
 
     def allowed(user_id: int) -> bool:
         return user_id in ALLOWED_IDS
@@ -363,6 +478,49 @@ def build_dispatcher(lamp: Lamp):
             lamp.power(True)
             lamp.mode(mode)
             return f"Mode {mode}"
+        if action == "t":
+            if arg.lower() in ("off", "stop"):
+                lamp.send("led-timer-start", "false")
+                return "Sleep timer stopped"
+            t = parse_hhmm(arg)
+            if not t:
+                return "Need a time like 00:30 (hours:minutes)"
+            lamp.send("led-timer-time", t)
+            lamp.send("led-timer-start", "true")
+            return f"Sleep timer {t}"
+        if action == "sr":
+            if arg.lower() in ("on", "off"):
+                lamp.send("led-sunrise-enabled", arg.lower() == "on" and "true" or "false")
+                return f"Sunrise {arg.lower()}"
+            t = parse_hhmm(arg)
+            if not t:
+                return "Need a time like 07:30, or on / off"
+            lamp.send("led-sunrise-time", t)
+            lamp.send("led-sunrise-enabled", "true")
+            return f"Sunrise at {t}"
+        if action == "fade":
+            t = parse_hhmm(arg)
+            if not t:
+                return "Need a time like 00:05"
+            lamp.send("led-fade-time", t)
+            return f"Fade time {t}"
+        if action in ("ms", "mn"):
+            if not arg.isdigit():
+                return "Need a number 0-100"
+            lamp.prop("led-mic-sens" if action == "ms" else "led-mic-noise", int(arg))
+            return f"Mic {'sensitivity' if action == 'ms' else 'noise'} {arg}"
+        if action == "eco":
+            on = arg.lower() in ("on", "1", "true", "yes")
+            lamp.send("power-limit", "Power saving" if on else "Default")
+            return f"Eco {'on' if on else 'off'}"
+        if action == "scene":
+            snap = load_scenes().get(arg.strip().lower())
+            if not snap:
+                return f"No scene '{arg}', see /scenes"
+            lamp.power(True)
+            for k, v in snap.items():
+                lamp.send(k, v)
+            return f"Scene {arg.strip().lower()}"
         return "?"
 
     def guarded(handler):
@@ -401,13 +559,32 @@ def build_dispatcher(lamp: Lamp):
     async def modes(message: Message):
         await message.answer("Modes:", reply_markup=modes_kb())
 
-    @dp.message(Command("brightness", "speed", "intensity", "color", "color2", "color3", "mode"))
+    commands = {"brightness": "b", "speed": "s", "intensity": "i", "color": "c", "color2": "c2",
+                "color3": "c3", "mode": "m", "timer": "t", "sunrise": "sr", "fade": "fade",
+                "micsens": "ms", "micnoise": "mn", "eco": "eco", "scene": "scene"}
+
+    @dp.message(Command(*commands))
     @guarded
     async def with_arg(message: Message):
         cmd = message.text.split()[0].lstrip("/").split("@")[0]
-        act = {"brightness": "b", "speed": "s", "intensity": "i", "color": "c",
-               "color2": "c2", "color3": "c3", "mode": "m"}[cmd]
-        await message.answer(apply(act, arg_of(message)))
+        await message.answer(apply(commands[cmd], arg_of(message)))
+
+    @dp.message(Command("save"))
+    @guarded
+    async def save(message: Message):
+        name = arg_of(message).lower()
+        if not name or len(name) > 20:
+            return await message.answer("Usage: /save name (up to 20 characters)")
+        snap = lamp.snapshot()
+        if not snap:
+            return await message.answer("The lamp has not reported its state yet")
+        save_scene(name, snap)
+        await message.answer(f"Saved scene '{name}'")
+
+    @dp.message(Command("scenes"))
+    @guarded
+    async def scenes(message: Message):
+        await message.answer("Scenes:", reply_markup=scenes_kb())
 
     @dp.callback_query(F.data)
     async def cb(call: CallbackQuery):
@@ -416,6 +593,9 @@ def build_dispatcher(lamp: Lamp):
         data = call.data
         if data == "modes":
             await call.message.answer("Modes:", reply_markup=modes_kb())
+            return await call.answer()
+        if data == "scenes":
+            await call.message.answer("Scenes:", reply_markup=scenes_kb())
             return await call.answer()
         if data == "status":
             await call.message.answer(lamp.status_text())
@@ -466,6 +646,7 @@ async def main():
 
     broker = await run_broker() if EMBEDDED_BROKER else None
     http = await run_http_stub()
+    dns = await run_dns_stub() if DNS_STUB else None
     lamp = Lamp(port=MQTT_PORT)
     lamp.start()
 
@@ -481,6 +662,8 @@ async def main():
         lamp.stop()
         if http:
             http.close()
+        if dns:
+            dns.close()
         if broker:
             await broker.shutdown()
 

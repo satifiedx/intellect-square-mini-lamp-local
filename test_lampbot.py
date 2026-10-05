@@ -41,6 +41,45 @@ async def main():
     assert lampbot.find_mode("sound reactive FIRE") == "Sound reactive fire"
     assert lampbot.find_mode("nope") is None
 
+    assert lampbot.parse_hhmm("7:30") == "07:30" and lampbot.parse_hhmm("00.05") == "00:05"
+    assert lampbot.parse_hhmm("25:00") is None and lampbot.parse_hhmm("abc") is None
+
+    import pathlib
+    import socket
+    import tempfile
+
+    lampbot.SCENES_FILE = pathlib.Path(tempfile.mkdtemp()) / "scenes.json"
+    lampbot.save_scene("evening", {"led-mode": "Meteor", "led-color-1": "1,2,3"})
+    assert lampbot.load_scenes()["evening"]["led-mode"] == "Meteor"
+
+    def dns_query(name, qtype, port):
+        labels = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00"
+        q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + labels + qtype.to_bytes(2, "big") + b"\x00\x01"
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(3)
+            s.sendto(q, ("127.0.0.1", port))
+            return s.recv(4096)
+
+    class Upstream(asyncio.DatagramProtocol):
+        def connection_made(self, t):
+            self.t = t
+
+        def datagram_received(self, data, addr):
+            self.t.sendto(b"UPSTREAM" + data[:2], addr)
+
+    loop = asyncio.get_running_loop()
+    up, _ = await loop.create_datagram_endpoint(Upstream, local_addr=("127.0.0.1", 15354))
+    lampbot.DNS_UPSTREAM = "127.0.0.1:15354"
+    dns = await loop.create_datagram_endpoint(lambda: lampbot.DnsStub("192.168.1.50"), local_addr=("127.0.0.1", 15353))
+    ans = await loop.run_in_executor(None, dns_query, "intellect.properties", 1, 15353)
+    assert ans[:2] == b"\x12\x34" and ans[-4:] == socket.inet_aton("192.168.1.50"), ans
+    empty = await loop.run_in_executor(None, dns_query, "intellect.properties", 28, 15353)
+    assert empty[6:8] == b"\x00\x00"
+    other = await loop.run_in_executor(None, dns_query, "example.com", 1, 15353)
+    assert other == b"UPSTREAM\x12\x34", other
+    dns[0].close()
+    up.close()
+
     broker = await lampbot.run_broker()
     http = await lampbot.run_http_stub()
     lamp = lampbot.Lamp(port=18830)
@@ -67,7 +106,9 @@ async def main():
     lamp.color_n(2, (1, 2, 3))
     lamp.prop("led-speed", 250)
     lamp.mode("Meteor")
+    lamp.send("led-timer-time", "00:30")
     await asyncio.sleep(1.5)
+    assert ("led-timer-time", "00:30") in received
     assert ("led-on", "false") in received
     assert ("led-brightness", "1") in received
     assert ("led-color-1", "117,213,28") in received
