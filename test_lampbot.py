@@ -41,6 +41,11 @@ async def main():
     assert lampbot.find_mode("sound reactive FIRE") == "Sound reactive fire"
     assert lampbot.find_mode("nope") is None
 
+    q = bytes.fromhex("123401000001000000000000" "03616263026465" "00" "00010001")
+    assert lampbot.dns_a_record(lampbot.dns_answer(q, "93.184.216.34")) == "93.184.216.34"
+    assert lampbot.dns_a_record(b"garbage") is None
+    lampbot.CLOUD_HOST = "9.9.9.9"
+    assert lampbot.resolve_cloud() == "9.9.9.9"
     assert lampbot.parse_hhmm("7:30") == "07:30" and lampbot.parse_hhmm("00.05") == "00:05"
     assert lampbot.parse_hhmm("25:00") is None and lampbot.parse_hhmm("abc") is None
 
@@ -116,6 +121,47 @@ async def main():
     assert ("led-speed", "100") in received
     assert ("led-mode", "Meteor") in received
     assert lamp.state.get("led-module/led-color-1") == "117,213,28"
+    import capture
+    assert capture.CREDS == {"user": "user", "password": "pass"}, capture.CREDS
+
+    from amqtt.broker import Broker
+    cloud = Broker({"listeners": {"default": {"type": "tcp", "bind": "127.0.0.1:18831"}}, "sys_interval": 0,
+                    "plugins": {"amqtt.plugins.authentication.AnonymousAuthPlugin": {}}})
+    await cloud.start()
+    lampbot.CLOUD_HOST, lampbot.CLOUD_PORT = "127.0.0.1", 18831
+    lampbot.STATE_FILE = pathlib.Path(tempfile.mkdtemp()) / "bot-state.json"
+    bridge = lampbot.Bridge(lamp)
+    lamp.bridge = bridge
+    await loop.run_in_executor(None, bridge.connect, "user", "pass")
+    for _ in range(50):
+        if bridge.connected:
+            break
+        await asyncio.sleep(0.1)
+    assert bridge.connected
+
+    app_seen = []
+    app = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="app")
+    app.on_connect = lambda c, u, f, rc, p=None: c.subscribe(f"{BASE}/#")
+    app.on_message = lambda c, u, m: app_seen.append((m.topic.rsplit("/", 1)[-1], m.payload.decode()))
+    app.connect("127.0.0.1", 18831)
+    app.loop_start()
+    await asyncio.sleep(1)
+    fake.publish(f"{BASE}/led-module/led-brightness", "42")
+    await asyncio.sleep(1)
+    assert ("led-brightness", "42") in app_seen, app_seen
+
+    app.publish(f"{BASE}/led-module/led-color-1/set", "9,9,9")
+    await asyncio.sleep(1)
+    assert ("led-color-1", "9,9,9") in received, received
+
+    bridge.app_control = False
+    app.publish(f"{BASE}/led-module/led-color-1/set", "8,8,8")
+    await asyncio.sleep(1)
+    assert ("led-color-1", "8,8,8") not in received
+    assert "blocked" in lamp.status_text()
+    bridge.app_control = True
+    print("bridge OK")
+
     panel, apply = dp["panel"], dp["apply"]
     seen, todo, clicked = set(), ["main"], 0
     while todo:
@@ -132,15 +178,28 @@ async def main():
                 action, _, arg = data.partition(":")
                 if action == "nav":
                     todo.append(arg)
-                elif action not in ("target", "status"):
-                    result = apply(action, arg)
+                elif action not in ("target", "status", "app"):
+                    result = apply(action, "1:" + arg if action == "hsv" else arg)
                     assert not result.startswith(("?", "Need", "Unknown", "No such", "No scene")), (data, result)
                     clicked += 1
-    assert {"main", "colors", "bright", "modes", "modes:static", "modes:anim", "modes:sound", "scenes", "timers", "more"} <= seen, seen
+    assert {"main", "colors", "bright", "modes", "modes:static", "modes:anim", "modes:sound", "scenes", "timers", "more", "palette"} <= seen, seen
     print("menu OK:", len(seen), "pages,", clicked, "buttons")
+
+    received.clear()
+    lamp.state["led-module/led-color-1"] = "255,0,0"
+    assert apply("hsv", "1:h:120") == "Color 1: 0,255,0"
+    lamp.state["led-module/led-color-1"] = "0,255,0"
+    assert apply("hsv", "1:v:-20") == "Color 1: 0,204,0"
+    assert apply("scene", "ocean") == "Scene ocean" and apply("scene", "evening") == "Scene evening"
+    assert apply("scene", "nope").startswith("No scene")
+    await asyncio.sleep(1)
+    assert ("led-mode", "Gradient") in received and ("led-color-2", "0,255,200") in received, received
     print("ALL OK")
 
     await asyncio.get_running_loop().run_in_executor(None, lamp.stop)
+    await loop.run_in_executor(None, bridge.stop)
+    await loop.run_in_executor(None, app.loop_stop)
+    await cloud.shutdown()
     await asyncio.get_running_loop().run_in_executor(None, fake.loop_stop)
     http.close()
     await broker.shutdown()

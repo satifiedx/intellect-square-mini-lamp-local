@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.pcap
 scenes.json
+bot-state.json

@@ -148,6 +148,7 @@ To undo it, remove the override (on OpenWrt `uci del_list dhcp.@dnsmasq[0].addre
 | `/fade 00:05` | fade duration |
 | `/micsens 0-100`, `/micnoise 0-100` | microphone sensitivity and noise for the sound reactive modes |
 | `/eco on`, `/eco off` | power saving mode (lower current limit) |
+| `/preset ocean` | one of the ready made presets (same as `/scene`) |
 | `/save evening`, `/scenes`, `/scene evening` | save the current look (mode, colors, brightness, speed, intensity) under a name and bring it back later |
 
 Color names work in English, Russian and Ukrainian.
@@ -166,6 +167,23 @@ If `GROQ_API_KEY` is set, just send a voice message or plain text, no command ne
 Voice goes to Groq Whisper, the text goes to an LLM with a short prompt that returns a JSON list of actions, the bot applies them and replies what it did. The LLM is `openai/gpt-oss-20b` on Groq by default, change it with `GROQ_LLM` in `.env` if Groq renames or retires it (`GET https://api.groq.com/openai/v1/models` lists what you have).
 
 If you have the Antigravity CLI (`agy`) installed you can use it as the brain instead: set `AGENT=agy` and optionally `AGY_MODEL` and `AGY_EXE`. It is slower (5 to 20 seconds per phrase) and falls back to Groq if it fails or takes longer than 45 seconds.
+
+## Keep the official app working
+
+By default the lamp stops talking to the manufacturer, so the official INTELLECT app loses it. If you want both, turn on the bridge:
+
+1. Set `CLOUD_BRIDGE=1` in `.env` and restart the bot.
+2. Power cycle the lamp (or just wait, it reconnects), so the bot catches the lamp's own login.
+3. The bot connects to the manufacturer's server with that login and passes things both ways: the lamp state goes up, commands from the app come down to the lamp. The bot log shows `cloud bridge connected` and later `app -> ...` for every command from the app.
+
+In the bot, `More` has a switch **Official app: allowed / blocked**, so you can lock the app out when you do not want it to change things. `/status` shows the bridge state. The bridge needs internet on the machine that runs the bot. It is off by default because it keeps sending your lamp state to the manufacturer, which is exactly what plain local mode avoids. It was tested against a real lamp and the real cloud, but only on one lamp, so tell me if yours behaves differently.
+
+## Presets and colors
+
+- **Presets** (`/preset name`, or the `Scenes` page): `reading`, `relax`, `movie`, `night`, `focus`, `party`, `fireplace`, `ocean`, `sunset`, `meteor`. Your own scenes from `/save` show up next to them with a star.
+- **Colors page:** quick colors, then Hue, Saturation and Light buttons that nudge the color you are editing, a `More colors` page with 29 named colors, and a switch for which of the three colors you edit.
+- **Any color you want:** just send the bot a message with `#ff8800`, `ff8800`, `255 100 0` or a color name like `teal`, and it sets it. No command and no Groq key needed.
+- Low brightness makes fades look steppy, because the LEDs only have 256 levels per channel. If effects look choppy, raise the brightness and lower the effect speed first.
 
 ## Modes
 

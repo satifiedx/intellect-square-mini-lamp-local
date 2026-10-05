@@ -118,6 +118,14 @@ make it runnable (`chmod +x run.sh`) and add it to cron once a minute (`crontab 
 - `/save evening` saves how the lamp looks right now, `/scenes` brings it back.
 - All commands are in the main README.
 
+## Optional: keep the official app working too
+
+By default the official INTELLECT app stops seeing the lamp, because the lamp now talks to your bot. If you still want the app, add `CLOUD_BRIDGE=1` to `.env`, restart the bot and power cycle the lamp once. The bot then passes commands from the app to the lamp and the lamp state to the app. In the bot menu, `More` has a switch to allow or block the app. It needs internet on the computer with the bot, and it means your lamp state goes to the manufacturer again, so it is off by default.
+
+## Colors and presets
+
+Besides the color buttons you can send the bot any color as a message: `#ff8800`, `255 100 0` or a name like `teal`. The `Scenes` page has ready made presets (reading, relax, movie, night, focus, party, fireplace, ocean, sunset, meteor).
+
 ## Something is wrong
 
 - **The bot does not answer in Telegram:** the terminal must still be open and show no errors. Check the token in `.env` has no spaces around it.

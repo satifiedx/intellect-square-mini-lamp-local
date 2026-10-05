@@ -1,4 +1,6 @@
 import asyncio
+import colorsys
+import ipaddress
 import json
 import logging
 import os
@@ -12,6 +14,8 @@ from pathlib import Path
 
 import httpx
 import paho.mqtt.client as mqtt
+
+import capture
 
 log = logging.getLogger("lampbot")
 
@@ -46,6 +50,11 @@ DNS_PORT = int(os.getenv("DNS_PORT", "53"))
 DNS_UPSTREAM = os.getenv("DNS_UPSTREAM", "8.8.8.8")
 LAN_IP = os.getenv("LAN_IP", "")
 DNS_NAME = "intellect.properties"
+CLOUD_BRIDGE = os.getenv("CLOUD_BRIDGE", "0") == "1"
+CLOUD_HOST = os.getenv("CLOUD_HOST", "")
+CLOUD_PORT = int(os.getenv("CLOUD_PORT", "1883"))
+CLOUD_DNS = os.getenv("CLOUD_DNS", "1.1.1.1")
+STATE_FILE = Path(os.getenv("STATE_FILE") or Path(__file__).with_name("bot-state.json"))
 
 MODES = [
     "Solid", "Solid 2", "Solid 3", "Percent", "Percent 2", "Strobe", "Rainbow", "Gradient",
@@ -70,6 +79,32 @@ COLORS = {
     "білий": (255, 255, 255), "теплий": (255, 147, 41), "жовтий": (255, 200, 0),
     "помаранчевий": (255, 100, 0), "фіолетовий": (150, 0, 255),
     "рожевий": (255, 50, 150), "блакитний": (0, 255, 255),
+    "teal": (0, 128, 128), "lime": (130, 255, 0), "magenta": (255, 0, 255), "gold": (255, 180, 0),
+    "coral": (255, 80, 60), "turquoise": (0, 220, 190), "indigo": (75, 0, 200), "violet": (160, 60, 255),
+    "lavender": (180, 140, 255), "mint": (120, 255, 190), "peach": (255, 150, 100), "salmon": (255, 100, 90),
+    "sky": (80, 170, 255), "navy": (0, 0, 120), "maroon": (140, 0, 30), "amber": (255, 110, 0),
+    "cold": (200, 220, 255), "daylight": (255, 244, 229), "candle": (255, 120, 30), "rose": (255, 40, 90),
+}
+
+NAMED = ["red", "orange", "amber", "gold", "yellow", "lime", "green", "mint", "teal", "turquoise", "cyan", "sky",
+         "blue", "navy", "indigo", "violet", "purple", "magenta", "pink", "rose", "coral", "salmon", "peach",
+         "maroon", "white", "cold", "daylight", "warm", "candle"]
+
+PRESETS = {
+    "reading": {"led-mode": "Solid", "led-color-1": "255,180,107", "led-brightness": "70"},
+    "relax": {"led-mode": "Gradient", "led-color-1": "255,90,20", "led-color-2": "255,30,120",
+              "led-brightness": "40", "led-speed": "15"},
+    "movie": {"led-mode": "Solid", "led-color-1": "255,120,40", "led-brightness": "12"},
+    "night": {"led-mode": "Solid", "led-color-1": "255,60,0", "led-brightness": "3"},
+    "focus": {"led-mode": "Solid", "led-color-1": "200,225,255", "led-brightness": "100"},
+    "party": {"led-mode": "Rainbow", "led-brightness": "100", "led-speed": "80"},
+    "fireplace": {"led-mode": "Fire", "led-brightness": "80"},
+    "ocean": {"led-mode": "Gradient", "led-color-1": "0,70,255", "led-color-2": "0,255,200",
+              "led-brightness": "60", "led-speed": "25"},
+    "sunset": {"led-mode": "Gradient", "led-color-1": "255,70,0", "led-color-2": "255,0,90",
+               "led-brightness": "60", "led-speed": "20"},
+    "meteor": {"led-mode": "Meteor", "led-color-1": "0,150,255", "led-color-2": "255,0,150",
+               "led-brightness": "80", "led-speed": "60"},
 }
 
 
@@ -99,6 +134,56 @@ def parse_hhmm(text: str):
     return f"{int(m.group(1)):02d}:{m.group(2)}" if m else None
 
 
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**kw) -> None:
+    STATE_FILE.write_text(json.dumps({**load_state(), **kw}, indent=1), encoding="utf-8")
+
+
+def dns_a_record(data: bytes):
+    try:
+        qd, an = struct.unpack(">HH", data[4:8])
+        i = 12
+        for _ in range(qd):
+            while data[i]:
+                i += data[i] + 1
+            i += 5
+        for _ in range(an):
+            while data[i] and data[i] < 0xC0:
+                i += data[i] + 1
+            i += 2 if data[i] >= 0xC0 else 1
+            rtype, _, _, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                return socket.inet_ntoa(data[i:i + 4])
+            i += rdlen
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
+def resolve_cloud() -> str:
+    if CLOUD_HOST:
+        return CLOUD_HOST
+    labels = b"".join(bytes([len(x)]) + x.encode() for x in DNS_NAME.split(".")) + b"\x00"
+    query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + labels + b"\x00\x01\x00\x01"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(3)
+            sock.sendto(query, (CLOUD_DNS, 53))
+            ip = dns_a_record(sock.recv(4096))
+        if ip and not ipaddress.ip_address(ip).is_private:
+            return ip
+    except OSError:
+        pass
+    return "188.166.167.132"
+
+
 def parse_color(text: str):
     t = text.strip().lower()
     if t in COLORS:
@@ -124,6 +209,7 @@ class Lamp:
         self.dev = os.getenv("LAMP_DEVICE") or None
         self.state: dict[str, str] = {}
         self.last_seen = 0.0
+        self.bridge = None
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="lampbot")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
@@ -142,15 +228,16 @@ class Lamp:
 
     def _on_message(self, client, userdata, msg):
         m = TOPIC_RE.match(msg.topic)
-        if not m or msg.topic.endswith("/set"):
-            return
-        if self.prefix is None or self.dev is None:
-            self.prefix, self.dev = m["prefix"], m["dev"]
-            log.info("lamp found: device %s", self.dev)
-        rest = m["rest"]
-        self.last_seen = time.time()
-        if rest != "$heartbeat":
-            self.state[rest] = msg.payload.decode("utf-8", "replace")
+        if m and not msg.topic.endswith("/set"):
+            if self.prefix is None or self.dev is None:
+                self.prefix, self.dev = m["prefix"], m["dev"]
+                log.info("lamp found: device %s", self.dev)
+            rest = m["rest"]
+            self.last_seen = time.time()
+            if rest != "$heartbeat":
+                self.state[rest] = msg.payload.decode("utf-8", "replace")
+        if self.bridge and not msg.topic.endswith("/set"):
+            self.bridge.up(msg)
 
     @property
     def online(self) -> bool:
@@ -213,12 +300,82 @@ class Lamp:
             f"LEDs: {g('led-count')}, firmware: {self.state.get('status-control/firmware-version', '?')}\n"
             f"Wi-Fi: {self.state.get('$telemetry/signal', '?')}\n"
             f"Uptime: {self.state.get('status-control/system-uptime', '?')}"
-        )
+        ) + self.bridge_line()
+
+    def bridge_line(self) -> str:
+        b = self.bridge
+        if not b:
+            return ""
+        return f"\nOfficial app: {'allowed' if b.app_control else 'blocked'}, cloud {'connected' if b.connected else 'not connected'}"
 
     def snapshot(self) -> dict:
         keys = ("led-mode", "led-color-1", "led-color-2", "led-color-3",
                 "led-brightness", "led-speed", "led-intensity")
         return {k: self.state["led-module/" + k] for k in keys if "led-module/" + k in self.state}
+
+
+class Bridge:
+    def __init__(self, lamp: Lamp):
+        self.lamp = lamp
+        self.client = None
+        self.connected = False
+        self.app_control = load_state().get("app_control", True)
+
+    def up(self, msg) -> None:
+        prefix = self.lamp.prefix
+        if not (self.connected and prefix and msg.topic.startswith(prefix + "/")):
+            return
+        retain = not msg.topic.endswith(("/$heartbeat", "/$telemetry/signal"))
+        self.client.publish(msg.topic, msg.payload, qos=0, retain=retain)
+
+    def connect(self, user: str, password) -> None:
+        host = resolve_cloud()
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"lampbot-bridge-{self.lamp.dev}")
+        c.username_pw_set(user, password)
+        c.on_connect = self._on_connect
+        c.on_disconnect = self._on_disconnect
+        c.on_subscribe = self._on_subscribe
+        c.on_message = self._on_message
+        self.client = c
+        log.info("cloud bridge: connecting to %s:%d", host, CLOUD_PORT)
+        c.connect_async(host, CLOUD_PORT, keepalive=60)
+        c.loop_start()
+
+    def stop(self) -> None:
+        if self.client:
+            self.client.loop_stop()
+            self.client.disconnect()
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        self.connected = not reason_code.is_failure
+        log.info("cloud bridge connected (%s)", reason_code)
+        if self.connected:
+            client.subscribe(f"{self.lamp.prefix}/sweet-home/{self.lamp.dev}/+/+/set", qos=1)
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
+        self.connected = False
+        log.warning("cloud bridge disconnected (%s)", reason_code)
+
+    def _on_subscribe(self, client, userdata, mid, reason_codes, properties=None):
+        log.info("cloud bridge subscribed: %s", [str(r) for r in reason_codes])
+
+    def _on_message(self, client, userdata, msg):
+        if not msg.topic.endswith("/set"):
+            return
+        if not self.app_control:
+            log.info("app command blocked: %s", msg.topic.split("/sweet-home/")[-1])
+            return
+        log.info("app -> %s = %s", msg.topic.split("/sweet-home/")[-1], msg.payload.decode("utf-8", "replace"))
+        self.lamp.client.publish(msg.topic, msg.payload, qos=1)
+
+
+async def run_bridge(lamp: Lamp):
+    bridge = Bridge(lamp)
+    lamp.bridge = bridge
+    while not (lamp.known and capture.CREDS.get("user")):
+        await asyncio.sleep(2)
+    await asyncio.get_running_loop().run_in_executor(
+        None, bridge.connect, capture.CREDS["user"], capture.CREDS.get("password"))
 
 
 async def run_broker():
@@ -227,8 +384,7 @@ async def run_broker():
     config = {
         "listeners": {"default": {"type": "tcp", "bind": f"0.0.0.0:{MQTT_PORT}"}},
         "sys_interval": 0,
-        "auth": {"allow-anonymous": True, "plugins": ["auth_anonymous"]},
-        "topic-check": {"enabled": False},
+        "plugins": {"capture.CapturePlugin": {}},
     }
     broker = Broker(config)
     await broker.start()
@@ -350,7 +506,7 @@ AGENT_PROMPT = (
     'sunrise alarm: sr with v "HH:MM" (wake up time, enables it), "on" or "off"; '
     'fade: fade with v "HH:MM" (fade duration); ms and mn microphone sensitivity and noise 0-100 for sound reactive modes; '
     'eco with v "on" or "off" (power saving, lower current limit); '
-    "scene with v the name of a saved scene (a list of saved scenes may follow).\n"
+    "scene with v the name of a saved scene or of a built in preset (" + ", ".join(PRESETS) + "; saved scenes may follow).\n"
     "Solid is one color. Meteor, Gradient, Plasma and some others use colors 1 and 2. "
     "Strobe and many effects depend on speed s. Sound reactive modes listen to the mic. "
     "You can chain actions, order matters (mode first, then colors). "
@@ -444,12 +600,17 @@ def build_dispatcher(lamp: Lamp):
             ]
         if name == "colors":
             t = targets.get(uid, "1")
-            return head + "\nPick a color", [
+            return head + f"\nEditing color {t}. Or just send me a hex like #ff8800, or three numbers like 255 100 0", [
                 [btn(e, f"c:{n}") for e, n in palette[:5]],
                 [btn(e, f"c:{n}") for e, n in palette[5:]],
-                [btn(f"Editing color {t}, tap to switch", "target")],
+                [btn("Hue −", "hsv:h:-30"), btn("Hue +", "hsv:h:30"), btn("Sat −", "hsv:s:-20"),
+                 btn("Sat +", "hsv:s:20"), btn("Light −", "hsv:v:-20"), btn("Light +", "hsv:v:20")],
+                [btn("More colors", "nav:palette"), btn(f"Editing color {t}, tap to switch", "target")],
                 back,
             ]
+        if name == "palette":
+            rows = [[btn(n, f"c:{n}") for n in NAMED[i:i + 4]] for i in range(0, len(NAMED), 4)]
+            return head + f"\nNamed colors (editing color {targets.get(uid, '1')})", rows + [[btn("⬅ Colors", "nav:colors")]]
         if name == "bright":
             return head, [
                 [btn(f"{v}%", f"b:{v}") for v in (10, 25, 50, 75, 100)],
@@ -469,9 +630,10 @@ def build_dispatcher(lamp: Lamp):
             rows.append([btn("⬅ Groups", "nav:modes")])
             return head + f"\n{label}", rows
         if name == "scenes":
-            names = list(load_scenes())
-            rows = [[btn(n, f"scene:{n}") for n in names[i:i + 3]] for i in range(0, len(names), 3)]
-            return head + "\nSave the current look with /save name", rows + [back]
+            names, presets = list(load_scenes()), list(PRESETS)
+            rows = [[btn(n.capitalize(), f"scene:{n}") for n in presets[i:i + 3]] for i in range(0, len(presets), 3)]
+            rows += [[btn(f"⭐ {n}", f"scene:{n}") for n in names[i:i + 3]] for i in range(0, len(names), 3)]
+            return head + "\nPresets, and your own scenes (star). Save the current look with /save name", rows + [back]
         if name == "timers":
             return (head + f"\nSleep timer: {g('led-timer-time')}, left {g('led-timer-left')}, running {g('led-timer-start')}"
                     f"\nSunrise: {g('led-sunrise-time')}, enabled {g('led-sunrise-enabled')}"
@@ -480,9 +642,12 @@ def build_dispatcher(lamp: Lamp):
                 [btn("Stop timer", "t:off"), btn("Sunrise on", "sr:on"), btn("Sunrise off", "sr:off")],
                 back,
             ]
+        app = ([[btn(f"Official app: {'allowed' if lamp.bridge.app_control else 'blocked'}, tap to switch", "app")]]
+               if lamp.bridge else [])
         return head + f"\nEco: {g('power-limit')}, mic sensitivity {g('led-mic-sens')}", [
             [btn("Eco on", "eco:on"), btn("Eco off", "eco:off")],
             [btn(f"Mic sens {v}", f"ms:{v}") for v in (30, 60, 90)],
+            *app,
             [btn("Full status", "status")],
             back,
         ]
@@ -492,7 +657,7 @@ def build_dispatcher(lamp: Lamp):
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
     def page_after(action: str, arg: str) -> str:
-        if action in ("c", "c2", "c3"):
+        if action in ("c", "c2", "c3", "hsv"):
             return "colors"
         if action in ("b", "bd"):
             return "bright"
@@ -601,8 +766,28 @@ def build_dispatcher(lamp: Lamp):
             on = arg.lower() in ("on", "1", "true", "yes")
             lamp.send("power-limit", "Power saving" if on else "Default")
             return f"Eco {'on' if on else 'off'}"
+        if action == "hsv":
+            slot, _, rest = arg.partition(":")
+            kind, _, delta = rest.partition(":")
+            try:
+                red, green, blue = (int(x) for x in lamp.state.get(f"led-module/led-color-{slot}", "255,255,255").split(","))
+                hue, sat, val = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
+                step = int(delta)
+            except ValueError:
+                return "?"
+            if kind == "h":
+                hue = (hue + step / 360) % 1
+            elif kind == "s":
+                sat = max(0.0, min(1.0, sat + step / 100))
+            elif kind == "v":
+                val = max(0.05, min(1.0, val + step / 100))
+            else:
+                return "?"
+            rgb = tuple(round(x * 255) for x in colorsys.hsv_to_rgb(hue, sat, val))
+            lamp.color_n(int(slot), rgb)
+            return "Color %s: %d,%d,%d" % ((slot,) + rgb)
         if action == "scene":
-            snap = load_scenes().get(arg.strip().lower())
+            snap = load_scenes().get(arg.strip().lower()) or PRESETS.get(arg.strip().lower())
             if not snap:
                 return f"No scene '{arg}', see /scenes"
             lamp.power(True)
@@ -651,7 +836,7 @@ def build_dispatcher(lamp: Lamp):
 
     commands = {"brightness": "b", "speed": "s", "intensity": "i", "color": "c", "color2": "c2",
                 "color3": "c3", "mode": "m", "timer": "t", "sunrise": "sr", "fade": "fade",
-                "micsens": "ms", "micnoise": "mn", "eco": "eco", "scene": "scene"}
+                "micsens": "ms", "micnoise": "mn", "eco": "eco", "scene": "scene", "preset": "scene"}
 
     @dp.message(Command(*commands))
     @guarded
@@ -700,6 +885,14 @@ def build_dispatcher(lamp: Lamp):
         if action == "status":
             await call.message.answer(lamp.status_text())
             return await call.answer()
+        if action == "app":
+            if lamp.bridge:
+                lamp.bridge.app_control = not lamp.bridge.app_control
+                save_state(app_control=lamp.bridge.app_control)
+            await show(call, "more")
+            return await call.answer("Official app " + ("allowed" if lamp.bridge and lamp.bridge.app_control else "blocked"))
+        if action == "hsv":
+            arg = f"{targets.get(uid, '1')}:{arg}"
         act = {"1": "c", "2": "c2", "3": "c3"}[targets.get(uid, "1")] if action == "c" else action
         await call.answer(apply(act, arg))
         await asyncio.sleep(0.5)
@@ -731,6 +924,9 @@ def build_dispatcher(lamp: Lamp):
     @dp.message(F.text & ~F.text.startswith("/"))
     @guarded
     async def free_text(message: Message):
+        if parse_color(message.text):
+            slot = targets.get(message.from_user.id, "1")
+            return await message.answer(apply({"1": "c", "2": "c2", "3": "c3"}[slot], message.text))
         if not GROQ_API_KEY:
             return await message.answer("GROQ_API_KEY is not set in .env")
         await run_agent(message, message.text)
@@ -752,6 +948,7 @@ async def main():
     dns = await run_dns_stub() if DNS_STUB else None
     lamp = Lamp(port=MQTT_PORT)
     lamp.start()
+    bridge_job = asyncio.create_task(run_bridge(lamp)) if CLOUD_BRIDGE else None
 
     from aiogram import Bot
 
@@ -762,6 +959,10 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        if bridge_job:
+            bridge_job.cancel()
+        if lamp.bridge:
+            await asyncio.get_running_loop().run_in_executor(None, lamp.bridge.stop)
         await asyncio.get_running_loop().run_in_executor(None, lamp.stop)
         if http:
             http.close()
