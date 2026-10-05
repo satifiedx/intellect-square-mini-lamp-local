@@ -6,6 +6,8 @@ Run the INTELLECT Square Mini Lamp without the vendor cloud. A small script pret
 
 Unofficial project, not affiliated with INTELLECT. Use at your own risk.
 
+**New to this? Start with the [simple step by step guide](docs/guide.md).** It assumes no technical background.
+
 ## How it works
 
 The lamp has an ESP8266 (ESP-07S module) with closed firmware. Nothing listens on its ports, but it is very chatty on boot. I sniffed it on the router with tcpdump and found out:
